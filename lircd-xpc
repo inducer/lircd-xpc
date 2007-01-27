@@ -160,7 +160,7 @@ class LIRCClient:
 
 class LIRCServer:
     def __init__(self, remotes, socket_path="/dev/lircd", owner="root", group="root", 
-            permissions=0777):
+            permissions=0666):
         self.remotes = remotes
         import os, pwd, grp
 
