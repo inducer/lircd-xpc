@@ -1,0 +1,485 @@
+#!/usr/bin/python
+# -----------------------------------------------------------------------------
+# Support for Intervideo XPC-RC01 remote
+# (C) Andreas Kloeckner 2007
+#
+# uses daemonization from
+# http://homepage.hispeed.ch/py430/python/
+# based on Juergen Hermanns'
+#   http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/66012
+# -----------------------------------------------------------------------------
+
+
+
+
+LOGFILE = "/var/log/lircd-xpc.log"
+PIDFILE = "/var/run/lircd-xpc.pid"
+
+
+
+
+from threading import Thread, Condition, Lock, Timer
+import hidwrap
+import sys
+import time
+
+
+
+
+def format_report(bytes):
+    return " ".join(hex(ord(b)) for b in bytes)
+
+
+
+
+class LIRCRemote:
+    def _name(self):
+        return self.get_name()
+    name = property(_name)
+
+    def describe_key(self, keycode):
+        raise NotImplementedError
+
+
+
+class IntervideoRemote(LIRCRemote):
+    def get_name(self):
+        return "intervideo"
+
+    def describe_key(self, keycode):
+        keymap = {
+                0x40002: "power",
+                0x1071f: "tv",
+                0x1070b: "print",
+                0x1043d: "close",
+                0x10720: "music",
+                0x10721: "pictures",
+                0x10722: "video",
+                0x1071e: "dvd",
+
+                0x10052: "up",
+                0x10050: "left",
+                0x1004f: "right",
+                0x10051: "down",
+
+                0x30010: "back",
+                0x10028: "ok",
+                0x1002b: "tab",
+
+                0x10105: "skip_back",
+                0x10113: "play_pause",
+                0x10109: "skip_fwd",
+                0x10305: "rewind",
+                0x10116: "stop",
+                0x10309: "forward",
+
+                0x30002: "volume_up",
+                0x30004: "volume_down",
+                0x1004b: "channel_up",
+                0x1004e: "channel_down",
+                0x1074a: "home",
+
+                0x30001: "mute",
+                0x10115: "record",
+                0x10709: "shuffle",
+                0x10705: "repeat",
+
+                0x1001e: "1",
+                0x1001f: "2",
+                0x10020: "3",
+                0x10021: "4",
+                0x10022: "5",
+                0x10023: "6",
+                0x10024: "7",
+                0x10025: "8",
+                0x10026: "9",
+                0x10027: "0",
+                }
+        try:
+            return keymap[keycode]
+        except KeyError:
+            return "undescribed"
+
+
+
+
+class LIRCClient:
+    def __init__(self, server, socket):
+        self.server = server
+        self.socket = socket
+
+        self.event_queue = []
+        self.queue_condition = Condition()
+
+        self.queue_thread = Thread(target=self.serve_queue)
+        self.queue_thread.setDaemon(True)
+        self.queue_thread.start()
+
+        self.reader_thread = Thread(target=self.read_socket)
+        self.reader_thread.setDaemon(True)
+        self.reader_thread.start()
+
+    def enqueue(self, event, data):
+        self.queue_condition.acquire()
+        self.event_queue.append((event, data))
+        self.queue_condition.notify()
+        self.queue_condition.release()
+
+    def serve_queue(self):
+        # this is the only routine that may write to the client socket
+        while True:
+            self.queue_condition.acquire()
+            while not self.event_queue:
+                self.queue_condition.wait()
+            event, data = self.event_queue.pop(0)
+            self.queue_condition.release()
+
+            if event == "receive":
+                ev_type, remote, code, count = data
+                if ev_type in ["push", "repeat"]:
+                    self.socket.send("%016x %03d %s %s\n" % (code, count, remote.describe_key(code), remote.name))
+            elif event == "quit":
+                self.server.remove_client(self)
+                return
+
+    def read_socket(self):
+        while True:
+            # FIXME actually answer the requests... :)
+            data = self.socket.recv(1024)
+            if not data:
+                self.enqueue("quit", None)
+                return
+
+    def notify(self, ev_type, remote, code, count):
+        self.enqueue("receive", (ev_type, remote, code, count))
+
+
+
+
+
+
+class LIRCServer:
+    def __init__(self, remotes, socket_path="/dev/lircd", owner="root", group="root", 
+            permissions=0777):
+        self.remotes = remotes
+        import os, pwd, grp
+
+        from socket import socket, AF_UNIX, SOCK_STREAM
+
+        try:
+            os.unlink(socket_path)
+        except OSError:
+            pass
+
+        self.socket = socket(AF_UNIX, SOCK_STREAM)
+        self.socket.bind(socket_path)
+        os.chmod(socket_path, permissions)
+        os.chown(socket_path, pwd.getpwnam(owner).pw_uid, grp.getgrnam(group).gr_gid)
+
+        self.clients = []
+        self.lock = Lock()
+
+        self.listen_thread = Thread(target=self.listen)
+        self.listen_thread.setDaemon(True)
+        self.listen_thread.start()
+
+    def listen(self):
+        while True:
+            self.socket.listen(1)
+            client_socket, address = self.socket.accept()
+            self.lock.acquire()
+            try:
+                self.clients.append(LIRCClient(self, client_socket))
+            finally:
+                self.lock.release()
+
+    def remove_client(self, client):
+        self.lock.acquire()
+        try:
+            self.clients.remove(client)
+        finally:
+            self.lock.release()
+
+    def notify(self, ev_type, remote, code, count=0):
+        #print ev_type, remote.name, remote.describe_key(code), hex(code)
+        self.lock.acquire()
+        try:
+            for c in self.clients:
+                c.notify(ev_type, remote, code, count)
+        finally:
+            self.lock.release()
+
+
+
+
+class IntervideoRemoteTranslator:
+    def __init__(self, handler):
+        self.pushed_key = None
+        self.handler = handler
+
+    def handle_report(self, (endpoint, report)):
+        from struct import unpack
+
+        def do_push(keycode):
+            if self.pushed_key is None:
+                self.pushed_key = keycode
+                self.handler.push_key(keycode)
+            elif self.pushed_key == keycode:
+                # key repeat, who cares
+                pass
+            else:
+                # different keycode
+                print "WARNING: key 0x%x interrupted key 0x%x" % (keycode, self.pushed_key)
+
+        def do_release():
+            if self.pushed_key is not None:
+                self.handler.release_key(self.pushed_key)
+                self.pushed_key = None
+
+        assert len(report) == 8
+        assert endpoint in [0x81, 0x82]
+
+        rep_fmt = "8B"
+        rep_data = unpack(rep_fmt, report)
+        report_id = rep_data[0]
+
+        if report_id == 2 and endpoint == 0x81:
+            do_release()
+        if report_id == 1 and endpoint == 0x82 and rep_data[3] != 0:
+            do_push(report_id << 16 | rep_data[1] << 8 | rep_data[3])
+        if report_id == 3 and endpoint == 0x82 and rep_data[1] != 0:
+            do_push(report_id << 16 | rep_data[1])
+        if report_id == 4 and endpoint == 0x82 and rep_data[1] != 0:
+            do_push(report_id << 16 | rep_data[1])
+
+
+
+
+
+class RemoteHandler:
+    def __init__(self, remote, lirc_server):
+        self.remote = remote
+        self.lirc_server = lirc_server
+
+    def push_key(self, keycode):
+        self.lirc_server.notify("push", self.remote, keycode)
+
+    def release_key(self, keycode):
+        self.lirc_server.notify("release", self.remote, keycode)
+
+
+
+
+class SoftRepeatRemoteHandler(RemoteHandler):
+    def __init__(self, remote, lirc_server, repeat_interval=0.1):
+        RemoteHandler.__init__(self, remote, lirc_server)
+
+        self.repeat_interval = repeat_interval
+        self.current_timer = None
+        self.current_key = None
+        self.lock = Lock()
+
+    def push_key(self, keycode):
+        RemoteHandler.push_key(self, keycode)
+        self.cancel_repeat()
+        self.repeat_count = 1
+        self.keycode = keycode
+        self.current_timer = Timer(self.repeat_interval, self.repeat_key)
+        self.current_timer.start()
+        
+    def repeat_key(self):
+        self.lock.acquire()
+        try:
+            if self.keycode:
+                self.lirc_server.notify("repeat", self.remote, self.keycode, self.repeat_count)
+                self.repeat_count += 1
+                self.current_timer = Timer(self.repeat_interval, self.repeat_key)
+                self.current_timer.start()
+        finally:
+            self.lock.release()
+
+    def cancel_repeat(self):
+        self.lock.acquire()
+        try:
+            if self.current_timer:
+                self.current_timer.cancel()
+                self.current_timer = None
+                self.current_key = None
+        finally:
+            self.lock.release()
+
+    def release_key(self, keycode):
+        RemoteHandler.release_key(self, keycode)
+        self.cancel_repeat()
+
+
+
+
+class USBReaderMaster:
+    def __init__(self):
+        self.event_queue = []
+        self.queue_condition = Condition()
+
+        self.readers = set([
+                InterfaceReader(self, 0, 0x81),
+                InterfaceReader(self, 1, 0x82)
+                ])
+
+        self.manager_thread = Thread(target=self.manage)
+        self.manager_thread.setDaemon(True)
+        self.manager_thread.start()
+        
+
+    def manage(self):
+        while True:
+            # all threads stopped. 
+            # (re-)init libhid and (re-)launch them.
+            if hidwrap.is_initialized():
+                hidwrap.cleanup()
+                sys.stderr.write("waiting...\n")
+                time.sleep(3)
+            hidwrap.init()
+
+            for r in self.readers:
+                r.start()
+
+            for r in self.readers:
+                r.join()
+
+    def enqueue_report(self, endpoint, report):
+        self.queue_condition.acquire()
+        self.event_queue.append((endpoint, report))
+        self.queue_condition.notify()
+        self.queue_condition.release()
+
+    def read_report(self):
+        self.queue_condition.acquire()
+        while not self.event_queue:
+            self.queue_condition.wait()
+        result = self.event_queue.pop(0)
+        self.queue_condition.release()
+        return result
+
+
+
+
+class InterfaceReader:
+    def __init__(self, master, interface_number, endpoint):
+
+        self.master = master
+        self.interface_number = interface_number
+        self.endpoint = endpoint
+
+        self.lock = Lock()
+        self.reader_thread = None
+
+    def start(self):
+        assert self.reader_thread is None
+
+        sys.stderr.write("ep thread %x starting\n" % self.endpoint)
+        self.reader_thread = Thread(target=self.run)
+        self.reader_thread.setDaemon(True)
+        self.reader_thread.start()
+
+    def join(self):
+        self.lock.acquire()
+        thread = self.reader_thread
+        self.lock.release()
+        if thread is not None:
+            thread.join()
+            self.lock.acquire()
+            self.reader_thread = None
+            self.lock.release()
+        sys.stderr.write("joined ep thread %x\n" % self.endpoint)
+
+    def run(self):
+        try:
+            try:
+                interface = hidwrap.Interface(vendor_id=0x3351, product_id=0x3715,
+                        interface_number=self.interface_number)
+
+                while True:
+                    self.master.enqueue_report(
+                            self.endpoint,
+                            interface.interrupt_read(self.endpoint, 8))
+            except hidwrap.HIDError, err:
+                sys.stderr.write("ep thread %x hid error: %s\n" % (self.endpoint, err))
+        finally:
+            self.lock.acquire()
+            self.reader_thread = None
+            self.lock.release()
+            sys.stderr.write("ep thread %x terminating\n" % self.endpoint)
+
+
+
+
+
+def main():
+    import hidwrap
+    import sys
+
+    #hidwrap.set_debug(hidwrap.HID_DEBUG_ALL)
+    #hidwrap.set_debug_stream(sys.stderr)
+
+    remote = IntervideoRemote()
+    lirc_server = LIRCServer([remote])
+    translator = IntervideoRemoteTranslator(SoftRepeatRemoteHandler(remote, lirc_server))
+    reader = USBReaderMaster()
+
+    while True:
+        translator.handle_report(reader.read_report())
+
+
+
+
+
+class Log:
+    """file-like for writes with auto flush after each write
+    to ensure that everything is logged, even during an
+    unexpected exit."""
+
+    def __init__(self, f):
+        self.f = f
+    def write(self, s):
+        self.f.write(s)
+        self.f.flush()
+
+
+
+
+if __name__ == '__main__':
+    import os
+
+    # do the UNIX double-fork magic, see Stevens' "Advanced
+    # Programming in the UNIX Environment" for details (ISBN 0201563177)
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit first parent
+            sys.exit(0)
+    except OSError, e:
+        print >>sys.stderr, "fork #1 failed: %d (%s)" % (e.errno, e.strerror)
+        sys.exit(1)
+
+    # decouple from parent environment
+    os.chdir("/")   #don't prevent unmounting....
+    os.setsid()
+    os.umask(0)
+
+    # do second fork
+    try:
+        pid = os.fork()
+        if pid > 0:
+            # exit from second parent, print eventual PID before
+            #print "Daemon PID %d" % pid
+            open(PIDFILE,'w').write("%d"%pid)
+            sys.exit(0)
+    except OSError, e:
+        print >>sys.stderr, "fork #2 failed: %d (%s)" % (e.errno, e.strerror)
+        sys.exit(1)
+
+    sys.stdout = sys.stderr = Log(open(LOGFILE, 'a+'))
+
+    # start the daemon main loop
+    main()
+
