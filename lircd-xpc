@@ -12,8 +12,7 @@
 
 
 
-LOGFILE = "/var/log/lircd-xpc.log"
-PIDFILE = "/var/run/lircd-xpc.pid"
+VERSION = "0.90"
 
 
 
@@ -320,10 +319,10 @@ class USBReaderMaster:
         self.event_queue = []
         self.queue_condition = Condition()
 
-        self.readers = set([
+        self.readers = [
                 InterfaceReader(self, 0, 0x81),
                 InterfaceReader(self, 1, 0x82)
-                ])
+                ]
 
         self.manager_thread = Thread(target=self.manage)
         self.manager_thread.setDaemon(True)
@@ -395,13 +394,13 @@ class InterfaceReader:
     def run(self):
         try:
             try:
+                sys.stderr.write("ep thread %x started\n" % self.endpoint)
                 interface = hidwrap.Interface(vendor_id=0x3351, product_id=0x3715,
                         interface_number=self.interface_number)
 
                 while True:
-                    self.master.enqueue_report(
-                            self.endpoint,
-                            interface.interrupt_read(self.endpoint, 8))
+                    rpt = interface.interrupt_read(self.endpoint, 8)
+                    self.master.enqueue_report(self.endpoint, rpt)
             except hidwrap.HIDError, err:
                 sys.stderr.write("ep thread %x hid error: %s\n" % (self.endpoint, err))
         finally:
@@ -450,36 +449,55 @@ class Log:
 if __name__ == '__main__':
     import os
 
-    # do the UNIX double-fork magic, see Stevens' "Advanced
-    # Programming in the UNIX Environment" for details (ISBN 0201563177)
-    try:
-        pid = os.fork()
-        if pid > 0:
-            # exit first parent
-            sys.exit(0)
-    except OSError, e:
-        print >>sys.stderr, "fork #1 failed: %d (%s)" % (e.errno, e.strerror)
-        sys.exit(1)
+    from optparse import OptionParser
 
-    # decouple from parent environment
-    os.chdir("/")   #don't prevent unmounting....
-    os.setsid()
-    os.umask(0)
+    description = "Provides a lircd-like interface to the Intervideo XPC-RC01 remote"
+    parser = OptionParser(description=description)
+    parser.add_option(
+	    "-n", "--nodaemon", dest="nodaemon", action="store_true",
+	    help="Do not fork into background")
+    parser.add_option(
+	    "-p", "--pidfile", dest="pidfile", default="/var/run/lircd-xpc.pid",
+	    help="Specify the PID file", metavar="PIDFILE")
+    parser.add_option(
+	    "-l", "--logfile", dest="logfile", default="/var/log/lircd-xpc.log",
+	    help="Specify the log file", metavar="LOGFILE")
 
-    # do second fork
-    try:
-        pid = os.fork()
-        if pid > 0:
-            # exit from second parent, print eventual PID before
-            #print "Daemon PID %d" % pid
-            open(PIDFILE,'w').write("%d"%pid)
-            sys.exit(0)
-    except OSError, e:
-        print >>sys.stderr, "fork #2 failed: %d (%s)" % (e.errno, e.strerror)
-        sys.exit(1)
+    options, args = parser.parse_args()
 
-    sys.stdout = sys.stderr = Log(open(LOGFILE, 'a+'))
+    if not options.nodaemon:
+      
+        # do the UNIX double-fork magic, see Stevens' "Advanced
+        # Programming in the UNIX Environment" for details (ISBN 0201563177)
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit first parent
+                sys.exit(0)
+        except OSError, e:
+            print >>sys.stderr, "fork #1 failed: %d (%s)" % (e.errno, e.strerror)
+            sys.exit(1)
 
-    # start the daemon main loop
+        # decouple from parent environment
+        os.chdir("/")   #don't prevent unmounting....
+        os.setsid()
+        os.umask(0)
+
+        # do second fork
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit from second parent, print eventual PID before
+                #print "Daemon PID %d" % pid
+                open(options.pidfile,'w').write("%d"%pid)
+                sys.exit(0)
+        except OSError, e:
+            print >>sys.stderr, "fork #2 failed: %d (%s)" % (e.errno, e.strerror)
+            sys.exit(1)
+
+        sys.stdout = sys.stderr = Log(open(options.logfile, 'a+'))
+
+        sys.stderr.write("starting lircd-xpc version %s with pid %d\n" % (VERSION, os.getpid()))
+
     main()
 
