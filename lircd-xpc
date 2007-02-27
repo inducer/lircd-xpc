@@ -12,13 +12,13 @@
 
 
 
-VERSION = "0.90"
+VERSION = "0.91"
 
 
 
 
 from threading import Thread, Condition, Lock, Timer
-import hidwrap
+import hid.hidwrap as hidwrap
 import sys
 import time
 
@@ -345,6 +345,10 @@ class USBReaderMaster:
             for r in self.readers:
                 r.join()
 
+    def end_all_threads(self):
+        for r in self.readers:
+            r.request_quit()
+
     def enqueue_report(self, endpoint, report):
         self.queue_condition.acquire()
         self.event_queue.append((endpoint, report))
@@ -391,7 +395,15 @@ class InterfaceReader:
             self.lock.release()
         sys.stderr.write("joined ep thread %x\n" % self.endpoint)
 
+    def request_quit(self):
+        self.lock.acquire()
+        self.quitflag = True
+        self.lock.release()
+
     def run(self):
+        self.lock.acquire()
+        self.quitflag = False
+        self.lock.release()
         try:
             try:
                 sys.stderr.write("ep thread %x started\n" % self.endpoint)
@@ -399,8 +411,18 @@ class InterfaceReader:
                         interface_number=self.interface_number)
 
                 while True:
-                    rpt = interface.interrupt_read(self.endpoint, 8)
-                    self.master.enqueue_report(self.endpoint, rpt)
+                    try:
+                        rpt = interface.interrupt_read(self.endpoint, 8, timeout=1000)
+                        self.master.enqueue_report(self.endpoint, rpt)
+                    except hidwrap.HIDError, err:
+                        if err.code != hidwrap.HID_RET_TIMEOUT:
+                            raise
+
+                        # we have a timeout, 
+                        self.lock.acquire()
+                        if self.quitflag:
+                            break
+                        self.lock.release()
             except hidwrap.HIDError, err:
                 sys.stderr.write("ep thread %x hid error: %s\n" % (self.endpoint, err))
         finally:
@@ -408,6 +430,7 @@ class InterfaceReader:
             self.reader_thread = None
             self.lock.release()
             sys.stderr.write("ep thread %x terminating\n" % self.endpoint)
+            self.master.end_all_threads()
 
 
 
@@ -466,7 +489,6 @@ if __name__ == '__main__':
     options, args = parser.parse_args()
 
     if not options.nodaemon:
-      
         # do the UNIX double-fork magic, see Stevens' "Advanced
         # Programming in the UNIX Environment" for details (ISBN 0201563177)
         try:

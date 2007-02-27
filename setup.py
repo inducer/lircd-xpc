@@ -4,7 +4,7 @@
 from distutils.core import setup,Extension
 
 setup(name="lircd-xpc",
-      version="0.90",
+      version="0.91",
       description="replacement lircd for XPC-RC01 remotes",
       author=u"Andreas Kloeckner",
       author_email="inform@tiker.net",
