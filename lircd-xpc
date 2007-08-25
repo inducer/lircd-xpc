@@ -437,7 +437,6 @@ class InterfaceReader:
 
 
 def main():
-    import hidwrap
     import sys
 
     #hidwrap.set_debug(hidwrap.HID_DEBUG_ALL)
