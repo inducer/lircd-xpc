@@ -18,9 +18,9 @@ VERSION = "0.91"
 
 
 from threading import Thread, Condition, Lock, Timer
-import hid.hidwrap as hidwrap
 import sys
 import time
+import usb
 
 
 
@@ -216,7 +216,7 @@ class IntervideoRemoteTranslator:
         self.pushed_key = None
         self.handler = handler
 
-    def handle_report(self, (endpoint, report)):
+    def handle_report(self, (endpoint, rep_data)):
         from struct import unpack
 
         def do_push(keycode):
@@ -235,11 +235,9 @@ class IntervideoRemoteTranslator:
                 self.handler.release_key(self.pushed_key)
                 self.pushed_key = None
 
-        assert len(report) == 8
+        assert len(rep_data) == 8
         assert endpoint in [0x81, 0x82]
 
-        rep_fmt = "8B"
-        rep_data = unpack(rep_fmt, report)
         report_id = rep_data[0]
 
         if report_id == 2 and endpoint == 0x81:
@@ -324,30 +322,9 @@ class USBReaderMaster:
                 InterfaceReader(self, 1, 0x82)
                 ]
 
-        self.manager_thread = Thread(target=self.manage)
-        self.manager_thread.setDaemon(True)
-        self.manager_thread.start()
-        
-
-    def manage(self):
-        while True:
-            # all threads stopped. 
-            # (re-)init libhid and (re-)launch them.
-            if hidwrap.is_initialized():
-                hidwrap.cleanup()
-                sys.stderr.write("waiting...\n")
-                time.sleep(3)
-            hidwrap.init()
-
-            for r in self.readers:
-                r.start()
-
-            for r in self.readers:
-                r.join()
-
-    def end_all_threads(self):
         for r in self.readers:
-            r.request_quit()
+            r.start()
+        
 
     def enqueue_report(self, endpoint, report):
         self.queue_condition.acquire()
@@ -366,14 +343,18 @@ class USBReaderMaster:
 
 
 
+VENDOR_ID = 0x3351
+PRODUCT_ID = 0x3715
+
+
+
+
 class InterfaceReader:
     def __init__(self, master, interface_number, endpoint):
-
         self.master = master
         self.interface_number = interface_number
         self.endpoint = endpoint
 
-        self.lock = Lock()
         self.reader_thread = None
 
     def start(self):
@@ -384,53 +365,52 @@ class InterfaceReader:
         self.reader_thread.setDaemon(True)
         self.reader_thread.start()
 
-    def join(self):
-        self.lock.acquire()
-        thread = self.reader_thread
-        self.lock.release()
-        if thread is not None:
-            thread.join()
-            self.lock.acquire()
-            self.reader_thread = None
-            self.lock.release()
-        sys.stderr.write("joined ep thread %x\n" % self.endpoint)
-
-    def request_quit(self):
-        self.lock.acquire()
-        self.quitflag = True
-        self.lock.release()
+    def open_device(self):
+        buses = usb.busses()
+        for bus in buses:
+            for device in bus.devices:
+                if device.idVendor == VENDOR_ID:
+                    if device.idProduct == PRODUCT_ID:
+                        try:
+                            handle = device.open()
+                            try:
+                                handle.detachKernelDriver(self.interface_number)
+                            except IOError:
+                                pass
+                            handle.claimInterface(self.interface_number)
+                            return handle
+                        except IOError, err:
+                            sys.stderr.write("ep thread %x found device, but: %s\n" %
+                                (self.endpoint,err))
+                            pass
+                        
+        raise IOError, "no usable device found"
 
     def run(self):
-        self.lock.acquire()
-        self.quitflag = False
-        self.lock.release()
-        try:
+        while True:
+            sys.stderr.write("ep thread %x started\n" % self.endpoint)
+            handle = None
+            iface_claimed = False
+
             try:
-                sys.stderr.write("ep thread %x started\n" % self.endpoint)
-                interface = hidwrap.Interface(vendor_id=0x3351, product_id=0x3715,
-                        interface_number=self.interface_number)
-
+                handle = self.open_device()
+                iface_claimed = True
                 while True:
-                    try:
-                        rpt = interface.interrupt_read(self.endpoint, 8, timeout=1000)
-                        self.master.enqueue_report(self.endpoint, rpt)
-                    except hidwrap.HIDError, err:
-                        if err.code != hidwrap.HID_RET_TIMEOUT:
-                            raise
+                    rpt = handle.interruptRead(self.endpoint, 8, 0)
+                    if len(rpt) == 0:
+                        raise IOError, "short report--device unplugged?"
+                    self.master.enqueue_report(self.endpoint, rpt)
+            except IOError, err:
+                sys.stderr.write("ep thread %x io error: %s\n" % (
+                    self.endpoint, err))
+                if handle is not None: 
+                    if iface_claimed:
+                        handle.releaseInterface()
+                        iface_claimed = False
+                    handle = None
 
-                        # we have a timeout, 
-                        self.lock.acquire()
-                        if self.quitflag:
-                            break
-                        self.lock.release()
-            except hidwrap.HIDError, err:
-                sys.stderr.write("ep thread %x hid error: %s\n" % (self.endpoint, err))
-        finally:
-            self.lock.acquire()
-            self.reader_thread = None
-            self.lock.release()
-            sys.stderr.write("ep thread %x terminating\n" % self.endpoint)
-            self.master.end_all_threads()
+            sys.stderr.write("ep thread %x waiting\n" % self.endpoint)
+            time.sleep(5)
 
 
 
@@ -438,9 +418,6 @@ class InterfaceReader:
 
 def main():
     import sys
-
-    #hidwrap.set_debug(hidwrap.HID_DEBUG_ALL)
-    #hidwrap.set_debug_stream(sys.stderr)
 
     remote = IntervideoRemote()
     lirc_server = LIRCServer([remote])
@@ -521,4 +498,3 @@ if __name__ == '__main__':
         sys.stderr.write("starting lircd-xpc version %s with pid %d\n" % (VERSION, os.getpid()))
 
     main()
-
