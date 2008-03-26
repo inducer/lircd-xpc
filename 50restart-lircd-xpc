@@ -1,0 +1,8 @@
+#!/bin/bash
+# drop me into /etc/pm/sleep.d
+
+case "$1" in
+	resume | thaw)
+		/etc/init.d/lircd-xpc restart
+		;;
+esac

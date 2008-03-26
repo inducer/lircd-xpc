@@ -425,7 +425,8 @@ def main():
     reader = USBReaderMaster()
 
     while True:
-        translator.handle_report(reader.read_report())
+        report = reader.read_report()
+        translator.handle_report(report)
 
 
 
